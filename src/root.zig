@@ -60,32 +60,14 @@ pub fn serialize(writer: *Writer, msg: anytype) !void {
             if (msg) |m| return serialize(writer, m);
             return serialize(writer, null);
         },
-        .pointer => return serialize(writer, msg.*),
-        .array => |info| {
-            if (msg.len > std.math.maxInt(u32)) return error.TooLong;
-            if (info.child == u8) {
-                const is_unicode = std.unicode.utf8ValidateSlice(&msg);
-                if (msg.len < 32 and is_unicode) {
-                    try writer.writeByte(@as(u8, msg.len) | 0b10100000);
-                } else if (msg.len <= std.math.maxInt(u8)) {
-                    try writer.writeAll(&.{ if (is_unicode) 0xd9 else 0xc4, @intCast(msg.len) });
-                } else if (msg.len <= std.math.maxInt(u16)) {
-                    try writer.writeByte(if (is_unicode) 0xda else 0xc5);
-                    var buf: [2]u8 = undefined;
-                    std.mem.writeInt(u16, &buf, @intCast(msg.len), .big);
-                    try writer.writeAll(&buf);
-                } else if (msg.len <= std.math.maxInt(u32)) {
-                    try writer.writeByte(if (is_unicode) 0xdb else 0xc6);
-                    var buf: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &buf, @intCast(msg.len), .big);
-                    try writer.writeAll(&buf);
-                }
-                try writer.writeAll(&msg);
-                return;
-            }
-            try writeArrayHeader(writer, msg.len);
-            for (msg) |e| try serialize(writer, e);
-            return;
+        .pointer => |info| {
+            if (info.size == .slice) return serializeSequence(writer, msg);
+            return serialize(writer, msg.*);
+        },
+        .array => return serializeSequence(writer, msg),
+        .@"enum" => |info| {
+            if (info.mode == .exhaustive) return serialize(writer, @tagName(msg));
+            return serialize(writer, @backingInt(msg));
         },
         .@"struct" => |info| {
             if (info.is_tuple) {
@@ -95,11 +77,50 @@ pub fn serialize(writer: *Writer, msg: anytype) !void {
                 }
                 return;
             }
-            // map is handled here
+
+            try writeMapHeader(writer, info.field_names.len);
+            inline for (info.field_names) |name| {
+                try serialize(writer, name);
+                try serialize(writer, @field(msg, name));
+            }
+            return;
         },
         else => unreachable,
     }
     unreachable;
+}
+
+fn serializeSequence(writer: *Writer, msg: anytype) !void {
+    const Child = switch (@typeInfo(@TypeOf(msg))) {
+        .array => |info| info.child,
+        .pointer => |info| info.child,
+        else => unreachable,
+    };
+    const values = msg[0..];
+
+    if (values.len > std.math.maxInt(u32)) return error.TooLong;
+    if (Child == u8) {
+        const is_unicode = std.unicode.utf8ValidateSlice(values);
+        if (values.len < 32 and is_unicode) {
+            try writer.writeByte(@as(u8, @intCast(values.len)) | 0b10100000);
+        } else if (values.len <= std.math.maxInt(u8)) {
+            try writer.writeAll(&.{ if (is_unicode) 0xd9 else 0xc4, @intCast(values.len) });
+        } else if (values.len <= std.math.maxInt(u16)) {
+            try writer.writeByte(if (is_unicode) 0xda else 0xc5);
+            var buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &buf, @intCast(values.len), .big);
+            try writer.writeAll(&buf);
+        } else if (values.len <= std.math.maxInt(u32)) {
+            try writer.writeByte(if (is_unicode) 0xdb else 0xc6);
+            var buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &buf, @intCast(values.len), .big);
+            try writer.writeAll(&buf);
+        }
+        try writer.writeAll(values);
+        return;
+    }
+    try writeArrayHeader(writer, values.len);
+    for (values) |e| try serialize(writer, e);
 }
 
 fn writeArrayHeader(writer: *Writer, len: usize) !void {
@@ -117,6 +138,64 @@ fn writeArrayHeader(writer: *Writer, len: usize) !void {
         std.mem.writeInt(u32, &buf, @intCast(len), .big);
         try writer.writeAll(&buf);
     }
+}
+
+fn writeMapHeader(writer: *Writer, len: usize) !void {
+    if (len > std.math.maxInt(u32)) return error.TooLong;
+    if (len < 16) {
+        try writer.writeByte(@as(u8, @intCast(len)) | 0b10000000);
+    } else if (len <= std.math.maxInt(u16)) {
+        try writer.writeByte(0xde);
+        var buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &buf, @intCast(len), .big);
+        try writer.writeAll(&buf);
+    } else if (len <= std.math.maxInt(u32)) {
+        try writer.writeByte(0xdf);
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf, @intCast(len), .big);
+        try writer.writeAll(&buf);
+    }
+}
+
+pub fn deserialize(comptime T: type, msg: []const u8) !T {
+    switch (@typeInfo(T)) {
+        .null => {
+            if (msg[0] == 0xc0) return null;
+            return error.BadValue;
+        },
+        .bool => return switch (msg[0]) {
+            0xc2 => false,
+            0xc3 => true,
+            else => error.BadValue,
+        },
+        .int => {
+            // uint
+            if ((msg[0] & 0b10000000) == 0) return @intCast(msg[0]);
+            // int
+            if ((msg[0] & 0b11100000) == 0b11100000) return @intCast(@as(i8, @bitCast(msg[0])));
+            return switch (msg[0]) {
+                // uint
+                0xcc => @intCast(msg[1]),
+                0xcd => @intCast(std.mem.readInt(u16, msg[1..3], .big)),
+                0xce => @intCast(std.mem.readInt(u32, msg[1..5], .big)),
+                0xcf => @intCast(std.mem.readInt(u64, msg[1..9], .big)),
+                // int
+                0xd0 => @intCast(@as(i8, @bitCast(msg[0]))),
+                0xd1 => @intCast(std.mem.readInt(i16, msg[1..3], .big)),
+                0xd2 => @intCast(std.mem.readInt(i32, msg[1..5], .big)),
+                0xd3 => @intCast(std.mem.readInt(i64, msg[1..9], .big)),
+
+                else => error.BadValue,
+            };
+        },
+        .float => return switch (msg[0]) {
+            0xca => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, msg[1..5], .big)))),
+            0xcb => @floatCast(@as(f64, @bitCast(std.mem.readInt(u64, msg[1..9], .big)))),
+            else => error.BadValue,
+        },
+        else => unreachable,
+    }
+    unreachable;
 }
 
 test serialize {
@@ -169,4 +248,23 @@ test serialize {
     try serialize(writer, &.{ 1, 2, 3 });
     try std.testing.expectEqualStrings(&.{ 0x93, 0x01, 0x02, 0x03 }, w.written());
     w.clearRetainingCapacity();
+
+    try serialize(writer, .{ .key = 3 });
+    try std.testing.expectEqualStrings(&.{ 0x81, 0xa3, 0x6b, 0x65, 0x79, 0x03 }, w.written());
+    w.clearRetainingCapacity();
+
+    const S = struct {
+        key: i64,
+    };
+    try serialize(writer, S{ .key = 3 });
+    try std.testing.expectEqualStrings(&.{ 0x81, 0xa3, 0x6b, 0x65, 0x79, 0x03 }, w.written());
+    w.clearRetainingCapacity();
+}
+
+test deserialize {
+    try std.testing.expectEqual(try deserialize(@TypeOf(null), &.{0xc0}), null);
+    try std.testing.expectEqual(try deserialize(bool, &.{0xc3}), true);
+    try std.testing.expectEqual(try deserialize(i8, &.{0xfd}), -3);
+    try std.testing.expectEqual(try deserialize(u64, &.{ 0xcf, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff }), 8589934591);
+    try std.testing.expectEqual(try deserialize(f64, &.{ 0xcb, 0x3f, 0xe4, 0x7a, 0xe1, 0x47, 0xae, 0x14, 0x7b }), 0.64);
 }
