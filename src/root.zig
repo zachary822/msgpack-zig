@@ -7,14 +7,8 @@ pub fn serialize(writer: *Writer, msg: anytype) !void {
     const T = @TypeOf(msg);
 
     switch (@typeInfo(T)) {
-        .void, .null => {
-            try writer.writeByte(0xc0);
-            return;
-        },
-        .bool => {
-            try writer.writeByte(if (msg) 0xc3 else 0xc2);
-            return;
-        },
+        .void, .null => try writer.writeByte(0xc0),
+        .bool => try writer.writeByte(if (msg) 0xc3 else 0xc2),
         .int => |info| {
             if (info.bits > 64) @compileError("msgpack: integers wider than 64 bits are not supported: " ++ @typeName(T));
             if (msg < 0 and msg >= -32) {
@@ -28,25 +22,15 @@ pub fn serialize(writer: *Writer, msg: anytype) !void {
             const storage_bits = comptime std.math.ceilPowerOfTwoAssert(u16, @max(info.bits, 8));
             const storage_bytes = storage_bits / 8;
             const Int = @Int(info.signedness, storage_bits);
-            var buf: [storage_bytes]u8 = undefined;
-            std.mem.writeInt(Int, &buf, @intCast(msg), .big);
             const tag: u8 = (if (info.signedness == .unsigned) 0xcc else 0xd0) + @as(u8, @intCast(@ctz(storage_bytes)));
             try writer.writeByte(tag);
-            try writer.writeAll(&buf);
-            return;
+            try writer.writeInt(Int, @intCast(msg), .big);
         },
         .float => |info| {
             if (info.bits > 64) @compileError("msgpack: floats wider than 64 bits are not supported: " ++ @typeName(T));
-            const storage_bits = if (info.bits <= 32) 32 else 64;
-            const storage_bytes = storage_bits / 8;
-            const Int = if (storage_bits == 32) u32 else u64;
-            var buf: [storage_bytes]u8 = undefined;
-            const F = if (storage_bits == 32) f32 else f64;
-            std.mem.writeInt(Int, &buf, @bitCast(@as(F, @floatCast(msg))), .big);
-            const tag = if (storage_bits == 32) 0xca else 0xcb;
-            try writer.writeByte(tag);
-            try writer.writeAll(&buf);
-            return;
+            const F = if (info.bits <= 32) f32 else f64;
+            try writer.writeByte(if (F == f32) 0xca else 0xcb);
+            try writer.writeInt(@Int(.unsigned, @bitSizeOf(F)), @bitCast(@as(F, @floatCast(msg))), .big);
         },
         .comptime_int => {
             if (msg < std.math.minInt(i64) or msg > std.math.maxInt(u64))
@@ -71,24 +55,41 @@ pub fn serialize(writer: *Writer, msg: anytype) !void {
             return serialize(writer, @backingInt(msg));
         },
         .@"struct" => |info| {
+            if (T == Io.Timestamp) {
+                const ns = msg.toNanoseconds();
+                const sec: i64 = @intCast(@divFloor(ns, std.time.ns_per_s));
+                const nsec: u32 = @intCast(@mod(ns, std.time.ns_per_s));
+                if (sec >= 0 and sec >> 34 == 0) {
+                    if (nsec == 0 and sec <= std.math.maxInt(u32)) {
+                        try writer.writeAll(&.{ 0xd6, 0xff });
+                        try writer.writeInt(u32, @intCast(sec), .big);
+                    } else {
+                        try writer.writeAll(&.{ 0xd7, 0xff });
+                        try writer.writeInt(u64, (@as(u64, nsec) << 34) | @as(u64, @intCast(sec)), .big);
+                    }
+                } else {
+                    try writer.writeAll(&.{ 0xc7, 12, 0xff });
+                    try writer.writeInt(u32, nsec, .big);
+                    try writer.writeInt(i64, sec, .big);
+                }
+                return;
+            }
             if (info.is_tuple) {
-                try writeArrayHeader(writer, info.field_names.len);
+                try writeHeader(writer, info.field_names.len, 0x90, 0xdc);
                 inline for (info.field_names) |name| {
                     try serialize(writer, @field(msg, name));
                 }
                 return;
             }
 
-            try writeMapHeader(writer, info.field_names.len);
+            try writeHeader(writer, info.field_names.len, 0x80, 0xde);
             inline for (info.field_names) |name| {
                 try serialize(writer, name);
                 try serialize(writer, @field(msg, name));
             }
-            return;
         },
         else => @compileError("msgpack: type not supported: " ++ @typeName(T)),
     }
-    unreachable;
 }
 
 fn serializeSequence(writer: *Writer, msg: anytype) !void {
@@ -99,8 +100,8 @@ fn serializeSequence(writer: *Writer, msg: anytype) !void {
     };
     const values = msg[0..];
 
-    if (values.len > std.math.maxInt(u32)) return error.TooLong;
     if (Child == u8) {
+        if (values.len > std.math.maxInt(u32)) return error.TooLong;
         const is_unicode = std.unicode.utf8ValidateSlice(values);
         if (values.len < 32 and is_unicode) {
             try writer.writeByte(@as(u8, @intCast(values.len)) | 0b10100000);
@@ -108,53 +109,28 @@ fn serializeSequence(writer: *Writer, msg: anytype) !void {
             try writer.writeAll(&.{ if (is_unicode) 0xd9 else 0xc4, @intCast(values.len) });
         } else if (values.len <= std.math.maxInt(u16)) {
             try writer.writeByte(if (is_unicode) 0xda else 0xc5);
-            var buf: [2]u8 = undefined;
-            std.mem.writeInt(u16, &buf, @intCast(values.len), .big);
-            try writer.writeAll(&buf);
-        } else if (values.len <= std.math.maxInt(u32)) {
+            try writer.writeInt(u16, @intCast(values.len), .big);
+        } else {
             try writer.writeByte(if (is_unicode) 0xdb else 0xc6);
-            var buf: [4]u8 = undefined;
-            std.mem.writeInt(u32, &buf, @intCast(values.len), .big);
-            try writer.writeAll(&buf);
+            try writer.writeInt(u32, @intCast(values.len), .big);
         }
         try writer.writeAll(values);
         return;
     }
-    try writeArrayHeader(writer, values.len);
+    try writeHeader(writer, values.len, 0x90, 0xdc);
     for (values) |e| try serialize(writer, e);
 }
 
-fn writeArrayHeader(writer: *Writer, len: usize) !void {
+fn writeHeader(writer: *Writer, len: usize, fix: u8, tag16: u8) !void {
     if (len > std.math.maxInt(u32)) return error.TooLong;
     if (len < 16) {
-        try writer.writeByte(@as(u8, @intCast(len)) | 0b10010000);
+        try writer.writeByte(fix | @as(u8, @intCast(len)));
     } else if (len <= std.math.maxInt(u16)) {
-        try writer.writeByte(0xdc);
-        var buf: [2]u8 = undefined;
-        std.mem.writeInt(u16, &buf, @intCast(len), .big);
-        try writer.writeAll(&buf);
-    } else if (len <= std.math.maxInt(u32)) {
-        try writer.writeByte(0xdd);
-        var buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &buf, @intCast(len), .big);
-        try writer.writeAll(&buf);
-    }
-}
-
-fn writeMapHeader(writer: *Writer, len: usize) !void {
-    if (len > std.math.maxInt(u32)) return error.TooLong;
-    if (len < 16) {
-        try writer.writeByte(@as(u8, @intCast(len)) | 0b10000000);
-    } else if (len <= std.math.maxInt(u16)) {
-        try writer.writeByte(0xde);
-        var buf: [2]u8 = undefined;
-        std.mem.writeInt(u16, &buf, @intCast(len), .big);
-        try writer.writeAll(&buf);
-    } else if (len <= std.math.maxInt(u32)) {
-        try writer.writeByte(0xdf);
-        var buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &buf, @intCast(len), .big);
-        try writer.writeAll(&buf);
+        try writer.writeByte(tag16);
+        try writer.writeInt(u16, @intCast(len), .big);
+    } else {
+        try writer.writeByte(tag16 + 1);
+        try writer.writeInt(u32, @intCast(len), .big);
     }
 }
 
@@ -225,6 +201,33 @@ pub fn deserializeAlloc(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T
             return out;
         },
         .@"struct" => |info| {
+            if (T == Io.Timestamp) {
+                const b = try reader.takeByte();
+                var sec: i64 = undefined;
+                var nsec: u32 = 0;
+                switch (b) {
+                    0xd6 => {
+                        if (try reader.takeByte() != 0xff) return error.BadValue;
+                        sec = try reader.takeInt(u32, .big);
+                    },
+                    0xd7 => {
+                        if (try reader.takeByte() != 0xff) return error.BadValue;
+                        const data = try reader.takeInt(u64, .big);
+                        sec = @intCast(data & ((1 << 34) - 1));
+                        nsec = @intCast(data >> 34);
+                    },
+                    0xc7 => {
+                        const hdr = try reader.takeArray(2);
+                        if (!std.mem.eql(u8, hdr, &.{ 12, 0xff })) return error.BadValue;
+                        nsec = try reader.takeInt(u32, .big);
+                        sec = try reader.takeInt(i64, .big);
+                    },
+                    else => return error.BadValue,
+                }
+                if (nsec >= std.time.ns_per_s) return error.BadValue;
+                return Io.Timestamp.fromNanoseconds(@as(i96, sec) * std.time.ns_per_s + nsec);
+            }
+
             inline for (info.field_attrs) |attrs| {
                 if (attrs.@"comptime") @compileError("msgpack: types with comptime fields are not supported: " ++ @typeName(T));
             }
@@ -259,19 +262,20 @@ pub fn deserializeAlloc(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T
             for (0..n) |_| {
                 const kb = try reader.takeByte();
                 const klen = try strLen(kb, reader) orelse return error.BadValue;
-                const key = try reader.readAlloc(gpa, klen);
-                defer gpa.free(key);
+                var buf: [maxNameLen(info.field_names)]u8 = undefined;
+                if (klen > buf.len) return error.BadValue;
+                const key = buf[0..klen];
+                try reader.readSliceAll(key);
 
-                var matched = false;
-                inline for (info.field_names, info.field_types, 0..) |name, FT, idx| {
-                    if (!matched and std.mem.eql(u8, name, key)) {
-                        matched = true;
+                const field = std.meta.stringToEnum(std.meta.FieldEnum(T), key) orelse return error.BadValue;
+                switch (field) {
+                    inline else => |f| {
+                        const idx = @backingInt(f);
                         if (seen.isSet(idx)) return error.BadValue;
                         seen.set(idx);
-                        @field(out, name) = try deserializeAlloc(FT, gpa, reader);
-                    }
+                        @field(out, @tagName(f)) = try deserializeAlloc(@FieldType(T, @tagName(f)), gpa, reader);
+                    },
                 }
-                if (!matched) return error.BadValue;
             }
             inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, FT, attrs, idx| {
                 if (!seen.isSet(idx)) {
@@ -291,8 +295,10 @@ pub fn deserializeAlloc(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T
             }
             const b = try reader.takeByte();
             const len = try strLen(b, reader) orelse return error.BadValue;
-            const name = try reader.readAlloc(gpa, len);
-            defer gpa.free(name);
+            var buf: [maxNameLen(info.field_names)]u8 = undefined;
+            if (len > buf.len) return error.BadValue;
+            const name = buf[0..len];
+            try reader.readSliceAll(name);
             return std.meta.stringToEnum(T, name) orelse error.BadValue;
         },
         else => @compileError("msgpack: unsupported type " ++ @typeName(T)),
@@ -319,6 +325,12 @@ fn deserializeSequence(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T 
     if (Child != u8) return error.BadValue;
     const n = try strLen(b, reader) orelse return error.BadValue;
     return try reader.readAlloc(gpa, n);
+}
+
+fn maxNameLen(comptime names: []const [:0]const u8) usize {
+    var max: usize = 0;
+    for (names) |name| max = @max(max, name.len);
+    return max;
 }
 
 fn strLen(b: u8, reader: *Io.Reader) !?usize {
@@ -435,6 +447,120 @@ test serialize {
     try serialize(writer, @as(f16, 1.5));
     try std.testing.expectEqualStrings(&.{ 0xca, 0x3f, 0xc0, 0x00, 0x00 }, w.written());
     w.clearRetainingCapacity();
+}
+
+test "serialize Io.Timestamp" {
+    const cases = .{
+        // timestamp 32
+        .{ 0, &[_]u8{ 0xd6, 0xff, 0x00, 0x00, 0x00, 0x00 } },
+        .{ 1_000_000_000, &[_]u8{ 0xd6, 0xff, 0x00, 0x00, 0x00, 0x01 } },
+        // largest seconds value for timestamp 32
+        .{ 4_294_967_295_000_000_000, &[_]u8{ 0xd6, 0xff, 0xff, 0xff, 0xff, 0xff } },
+        // timestamp 64: nanoseconds part
+        .{ 1_500_000_000, &[_]u8{ 0xd7, 0xff, 0x77, 0x35, 0x94, 0x00, 0x00, 0x00, 0x00, 0x01 } },
+        // timestamp 64: seconds do not fit in u32
+        .{ 4_294_967_296_000_000_000, &[_]u8{ 0xd7, 0xff, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 } },
+        // largest value for timestamp 64
+        .{ 17_179_869_183_999_999_999, &[_]u8{ 0xd7, 0xff, 0xee, 0x6b, 0x27, 0xff, 0xff, 0xff, 0xff, 0xff } },
+        // timestamp 96: seconds do not fit in 34 bits
+        .{ 17_179_869_184_000_000_000, &[_]u8{ 0xc7, 0x0c, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00 } },
+        // timestamp 96: negative, sec = -1 and nsec = 999999999
+        .{ -1, &[_]u8{ 0xc7, 0x0c, 0xff, 0x3b, 0x9a, 0xc9, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } },
+        // timestamp 96: negative, sec = -2 and nsec = 500000000
+        .{ -1_500_000_000, &[_]u8{ 0xc7, 0x0c, 0xff, 0x1d, 0xcd, 0x65, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe } },
+    };
+    inline for (cases) |c| {
+        var buf: [16]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        try serialize(&w, Io.Timestamp.fromNanoseconds(c[0]));
+        try std.testing.expectEqualStrings(c[1], w.buffered());
+    }
+}
+
+test "deserializeAlloc Io.Timestamp" {
+    const gpa = std.testing.allocator;
+    {
+        const cases = .{
+            // timestamp 32
+            .{ 0, &[_]u8{ 0xd6, 0xff, 0x00, 0x00, 0x00, 0x00 } },
+            .{ 4_294_967_295_000_000_000, &[_]u8{ 0xd6, 0xff, 0xff, 0xff, 0xff, 0xff } },
+            // timestamp 64
+            .{ 1_500_000_000, &[_]u8{ 0xd7, 0xff, 0x77, 0x35, 0x94, 0x00, 0x00, 0x00, 0x00, 0x01 } },
+            .{ 17_179_869_183_999_999_999, &[_]u8{ 0xd7, 0xff, 0xee, 0x6b, 0x27, 0xff, 0xff, 0xff, 0xff, 0xff } },
+            // timestamp 64 for a value that fits in timestamp 32
+            .{ 1_000_000_000, &[_]u8{ 0xd7, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } },
+            // timestamp 96
+            .{ 17_179_869_184_000_000_000, &[_]u8{ 0xc7, 0x0c, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00 } },
+            .{ -1, &[_]u8{ 0xc7, 0x0c, 0xff, 0x3b, 0x9a, 0xc9, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } },
+            .{ -1_500_000_000, &[_]u8{ 0xc7, 0x0c, 0xff, 0x1d, 0xcd, 0x65, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe } },
+            // timestamp 96 for a value that fits in timestamp 32
+            .{ 1_000_000_000, &[_]u8{ 0xc7, 0x0c, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } },
+        };
+        inline for (cases) |c| {
+            var r: Io.Reader = .fixed(c[1]);
+            const out = try deserializeAlloc(Io.Timestamp, gpa, &r);
+            try std.testing.expectEqual(@as(i96, c[0]), out.toNanoseconds());
+        }
+    }
+    {
+        const cases = .{
+            // not an extension
+            &[_]u8{0xc0},
+            // extension type is not -1
+            &[_]u8{ 0xd6, 0x01, 0x00, 0x00, 0x00, 0x00 },
+            &[_]u8{ 0xd7, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+            &[_]u8{ 0xc7, 0x0c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+            // ext 8 length is not 12
+            &[_]u8{ 0xc7, 0x08, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+            // nsec = 1000000000 in timestamp 64
+            &[_]u8{ 0xd7, 0xff, 0xee, 0x6b, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00 },
+            // nsec = 1000000000 in timestamp 96
+            &[_]u8{ 0xc7, 0x0c, 0xff, 0x3b, 0x9a, 0xca, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        };
+        inline for (cases) |c| {
+            var r: Io.Reader = .fixed(c);
+            try std.testing.expectError(error.BadValue, deserializeAlloc(Io.Timestamp, gpa, &r));
+        }
+    }
+    {
+        const cases = .{
+            &[_]u8{ 0xd6, 0xff, 0x00, 0x00 },
+            &[_]u8{ 0xd7, 0xff, 0x00, 0x00, 0x00, 0x00 },
+            &[_]u8{ 0xc7, 0x0c },
+            &[_]u8{ 0xc7, 0x0c, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        };
+        inline for (cases) |c| {
+            var r: Io.Reader = .fixed(c);
+            try std.testing.expectError(error.EndOfStream, deserializeAlloc(Io.Timestamp, gpa, &r));
+        }
+    }
+    {
+        const cases = [_]i96{
+            0,
+            1,
+            999_999_999,
+            1_000_000_000,
+            1_500_000_000,
+            4_294_967_295_000_000_000,
+            4_294_967_296_000_000_000,
+            17_179_869_183_999_999_999,
+            17_179_869_184_000_000_000,
+            -1,
+            -1_000_000_000,
+            -1_500_000_000,
+            @as(i96, std.math.maxInt(i64)) * std.time.ns_per_s + 999_999_999,
+            @as(i96, std.math.minInt(i64)) * std.time.ns_per_s,
+        };
+        for (cases) |ns| {
+            var buf: [16]u8 = undefined;
+            var w: Writer = .fixed(&buf);
+            try serialize(&w, Io.Timestamp.fromNanoseconds(ns));
+            var r: Io.Reader = .fixed(w.buffered());
+            const out = try deserializeAlloc(Io.Timestamp, gpa, &r);
+            try std.testing.expectEqual(ns, out.toNanoseconds());
+            try std.testing.expectEqual(0, r.bufferedLen());
+        }
+    }
 }
 
 test deserializeAlloc {
