@@ -157,45 +157,108 @@ fn writeMapHeader(writer: *Writer, len: usize) !void {
     }
 }
 
-pub fn deserialize(comptime T: type, msg: []const u8) !T {
+pub fn deserializeAlloc(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T {
     switch (@typeInfo(T)) {
-        .null => {
-            if (msg[0] == 0xc0) return null;
-            return error.BadValue;
-        },
-        .bool => return switch (msg[0]) {
+        .bool => return switch (try reader.takeByte()) {
             0xc2 => false,
             0xc3 => true,
             else => error.BadValue,
         },
         .int => {
+            const b = try reader.takeByte();
             // uint
-            if ((msg[0] & 0b10000000) == 0) return @intCast(msg[0]);
+            if ((b & 0b10000000) == 0) return @intCast(b);
             // int
-            if ((msg[0] & 0b11100000) == 0b11100000) return @intCast(@as(i8, @bitCast(msg[0])));
-            return switch (msg[0]) {
+            if ((b & 0b11100000) == 0b11100000) return @intCast(@as(i8, @bitCast(b)));
+            return switch (b) {
                 // uint
-                0xcc => @intCast(msg[1]),
-                0xcd => @intCast(std.mem.readInt(u16, msg[1..3], .big)),
-                0xce => @intCast(std.mem.readInt(u32, msg[1..5], .big)),
-                0xcf => @intCast(std.mem.readInt(u64, msg[1..9], .big)),
+                0xcc => @intCast(try reader.takeByte()),
+                0xcd => @intCast(try reader.takeInt(u16, .big)),
+                0xce => @intCast(try reader.takeInt(u32, .big)),
+                0xcf => @intCast(try reader.takeInt(u64, .big)),
                 // int
-                0xd0 => @intCast(@as(i8, @bitCast(msg[0]))),
-                0xd1 => @intCast(std.mem.readInt(i16, msg[1..3], .big)),
-                0xd2 => @intCast(std.mem.readInt(i32, msg[1..5], .big)),
-                0xd3 => @intCast(std.mem.readInt(i64, msg[1..9], .big)),
+                0xd0 => @intCast(try reader.takeInt(i8, .big)),
+                0xd1 => @intCast(try reader.takeInt(i16, .big)),
+                0xd2 => @intCast(try reader.takeInt(i32, .big)),
+                0xd3 => @intCast(try reader.takeInt(i64, .big)),
 
                 else => error.BadValue,
             };
         },
-        .float => return switch (msg[0]) {
-            0xca => @floatCast(@as(f32, @bitCast(std.mem.readInt(u32, msg[1..5], .big)))),
-            0xcb => @floatCast(@as(f64, @bitCast(std.mem.readInt(u64, msg[1..9], .big)))),
+        .float => return switch (try reader.takeByte()) {
+            0xca => @floatCast(@as(f32, @bitCast(try reader.takeInt(u32, .big)))),
+            0xcb => @floatCast(@as(f64, @bitCast(try reader.takeInt(u64, .big)))),
             else => error.BadValue,
         },
-        else => unreachable,
+        .optional => |info| {
+            if (try reader.peekByte() == 0xc0) {
+                reader.toss(1);
+                return null;
+            }
+            return try deserializeAlloc(info.child, gpa, reader);
+        },
+        .pointer => |info| {
+            if (info.size == .slice) return deserializeSequence(T, gpa, reader);
+            return error.BadValue;
+        },
+        .array => |info| {
+            var out: T = undefined;
+            const b = try reader.takeByte();
+            if (info.child == u8) {
+                if (try strLen(b, reader)) |n| {
+                    if (n != info.len) return error.BadValue;
+                    try reader.readSliceAll(&out);
+                    return out;
+                }
+            }
+            const n = try arrLen(b, reader) orelse return error.BadValue;
+            if (n != info.len) return error.BadValue;
+            for (&out) |*o| {
+                o.* = try deserializeAlloc(info.child, gpa, reader);
+            }
+            return out;
+        },
+        else => @compileError("msgpack: unsupported type " ++ @typeName(T)),
     }
     unreachable;
+}
+
+fn deserializeSequence(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T {
+    const Child = std.meta.Child(T);
+    const b = try reader.takeByte();
+    if (try arrLen(b, reader)) |n| {
+        const out = try gpa.alloc(Child, n);
+        errdefer gpa.free(out);
+        for (out) |*o| {
+            o.* = try deserializeAlloc(Child, gpa, reader);
+        }
+        return out;
+    }
+    if (Child != u8) return error.BadValue;
+    const n = try strLen(b, reader) orelse return error.BadValue;
+    return try reader.readAlloc(gpa, n);
+}
+
+fn strLen(b: u8, reader: *Io.Reader) !?usize {
+    if (b & 0b11100000 == 0b10100000) {
+        return b & 0b00011111;
+    }
+    return switch (b) {
+        0xd9, 0xc4 => @intCast(try reader.takeByte()),
+        0xda, 0xc5 => @intCast(try reader.takeInt(u16, .big)),
+        0xdb, 0xc6 => @intCast(try reader.takeInt(u32, .big)),
+        else => null,
+    };
+}
+
+fn arrLen(b: u8, reader: *Io.Reader) !?usize {
+    if (b & 0b11110000 == 0b10010000)
+        return b & 0b00001111;
+    return switch (b) {
+        0xdc => @intCast(try reader.takeInt(u16, .big)),
+        0xdd => @intCast(try reader.takeInt(u32, .big)),
+        else => null,
+    };
 }
 
 test serialize {
@@ -261,10 +324,56 @@ test serialize {
     w.clearRetainingCapacity();
 }
 
-test deserialize {
-    try std.testing.expectEqual(try deserialize(@TypeOf(null), &.{0xc0}), null);
-    try std.testing.expectEqual(try deserialize(bool, &.{0xc3}), true);
-    try std.testing.expectEqual(try deserialize(i8, &.{0xfd}), -3);
-    try std.testing.expectEqual(try deserialize(u64, &.{ 0xcf, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff }), 8589934591);
-    try std.testing.expectEqual(try deserialize(f64, &.{ 0xcb, 0x3f, 0xe4, 0x7a, 0xe1, 0x47, 0xae, 0x14, 0x7b }), 0.64);
+test deserializeAlloc {
+    const gpa = std.testing.allocator;
+    {
+        var r: Io.Reader = .fixed(&.{0xc0});
+        try std.testing.expectEqual(null, try deserializeAlloc(?u8, gpa, &r));
+    }
+    {
+        var r: Io.Reader = .fixed(&.{0xc3});
+        try std.testing.expectEqual(true, try deserializeAlloc(bool, gpa, &r));
+    }
+    {
+        var r: Io.Reader = .fixed(&.{0xfd});
+        try std.testing.expectEqual(-3, try deserializeAlloc(i8, gpa, &r));
+    }
+    {
+        var r: Io.Reader = .fixed(&.{ 0xcf, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff });
+        try std.testing.expectEqual(8589934591, try deserializeAlloc(u64, gpa, &r));
+    }
+    {
+        var r: Io.Reader = .fixed(&.{ 0xcb, 0x3f, 0xe4, 0x7a, 0xe1, 0x47, 0xae, 0x14, 0x7b });
+        try std.testing.expectEqual(0.64, try deserializeAlloc(f64, gpa, &r));
+    }
+    {
+        var r: Io.Reader = .fixed(&.{ 0b10100011, 0x61, 0x62, 0x63 });
+        const out = try deserializeAlloc([]const u8, gpa, &r);
+        defer gpa.free(out);
+        try std.testing.expectEqualStrings("abc", out);
+    }
+    {
+        var r: Io.Reader = .fixed(&.{ 0b10100011, 0x61, 0x62, 0x63 });
+        const out = try deserializeAlloc([3]u8, gpa, &r);
+        try std.testing.expectEqualStrings("abc", &out);
+    }
+    {
+        var r: Io.Reader = .fixed(&.{ 0xd9, 0x76, 0x53, 0x74, 0x72, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x66, 0x61, 0x6d, 0x69, 0x6c, 0x79, 0x20, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x73, 0x20, 0x61, 0x20, 0x62, 0x79, 0x74, 0x65, 0x20, 0x61, 0x72, 0x72, 0x61, 0x79, 0x20, 0x69, 0x6e, 0x20, 0x31, 0x2c, 0x20, 0x32, 0x2c, 0x20, 0x33, 0x2c, 0x20, 0x6f, 0x72, 0x20, 0x35, 0x20, 0x62, 0x79, 0x74, 0x65, 0x73, 0x20, 0x6f, 0x66, 0x20, 0x65, 0x78, 0x74, 0x72, 0x61, 0x20, 0x62, 0x79, 0x74, 0x65, 0x73, 0x20, 0x69, 0x6e, 0x20, 0x61, 0x64, 0x64, 0x69, 0x74, 0x69, 0x6f, 0x6e, 0x20, 0x74, 0x6f, 0x20, 0x74, 0x68, 0x65, 0x20, 0x73, 0x69, 0x7a, 0x65, 0x20, 0x6f, 0x66, 0x20, 0x74, 0x68, 0x65, 0x20, 0x62, 0x79, 0x74, 0x65, 0x20, 0x61, 0x72, 0x72, 0x61, 0x79, 0x2e });
+        const out = try deserializeAlloc([]const u8, gpa, &r);
+        defer gpa.free(out);
+        try std.testing.expectEqualStrings(
+            "Str format family stores a byte array in 1, 2, 3, or 5 bytes of extra bytes in addition to the size of the byte array.",
+            out,
+        );
+    }
+    {
+        var r: Io.Reader = .fixed(&.{ 0x93, 0x01, 0x02, 0x03 });
+        const out = try deserializeAlloc([]u8, gpa, &r);
+        defer gpa.free(out);
+        try std.testing.expectEqualStrings(&.{ 1, 2, 3 }, out);
+    }
+    {
+        var r: Io.Reader = .fixed(&.{ 0xdc, 0x00, 0x03, 0x01, 0xcd, 0x01, 0x00, 0x03 });
+        try std.testing.expectEqual([3]u64{ 1, 256, 3 }, try deserializeAlloc([3]u64, gpa, &r));
+    }
 }
