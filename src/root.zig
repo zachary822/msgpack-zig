@@ -41,7 +41,8 @@ pub fn serialize(writer: *Writer, msg: anytype) !void {
             const storage_bytes = storage_bits / 8;
             const Int = if (storage_bits == 32) u32 else u64;
             var buf: [storage_bytes]u8 = undefined;
-            std.mem.writeInt(Int, &buf, @bitCast(msg), .big);
+            const F = if (storage_bits == 32) f32 else f64;
+            std.mem.writeInt(Int, &buf, @bitCast(@as(F, @floatCast(msg))), .big);
             const tag = if (storage_bits == 32) 0xca else 0xcb;
             try writer.writeByte(tag);
             try writer.writeAll(&buf);
@@ -85,7 +86,7 @@ pub fn serialize(writer: *Writer, msg: anytype) !void {
             }
             return;
         },
-        else => unreachable,
+        else => @compileError("msgpack: type not supported: " ++ @typeName(T)),
     }
     unreachable;
 }
@@ -166,24 +167,26 @@ pub fn deserializeAlloc(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T
         },
         .int => {
             const b = try reader.takeByte();
-            // uint
-            if ((b & 0b10000000) == 0) return @intCast(b);
-            // int
-            if ((b & 0b11100000) == 0b11100000) return @intCast(@as(i8, @bitCast(b)));
-            return switch (b) {
-                // uint
-                0xcc => @intCast(try reader.takeByte()),
-                0xcd => @intCast(try reader.takeInt(u16, .big)),
-                0xce => @intCast(try reader.takeInt(u32, .big)),
-                0xcf => @intCast(try reader.takeInt(u64, .big)),
-                // int
-                0xd0 => @intCast(try reader.takeInt(i8, .big)),
-                0xd1 => @intCast(try reader.takeInt(i16, .big)),
-                0xd2 => @intCast(try reader.takeInt(i32, .big)),
-                0xd3 => @intCast(try reader.takeInt(i64, .big)),
+            const v: i128 =
+                if ((b & 0b10000000) == 0) // uint
+                    b
+                else if ((b & 0b11100000) == 0b11100000) // int
+                    @as(i8, @bitCast(b))
+                else switch (b) {
+                    // uint
+                    0xcc => try reader.takeByte(),
+                    0xcd => try reader.takeInt(u16, .big),
+                    0xce => try reader.takeInt(u32, .big),
+                    0xcf => try reader.takeInt(u64, .big),
+                    // int
+                    0xd0 => try reader.takeInt(i8, .big),
+                    0xd1 => try reader.takeInt(i16, .big),
+                    0xd2 => try reader.takeInt(i32, .big),
+                    0xd3 => try reader.takeInt(i64, .big),
 
-                else => error.BadValue,
-            };
+                    else => return error.BadValue,
+                };
+            return std.math.cast(T, v) orelse error.BadValue;
         },
         .float => return switch (try reader.takeByte()) {
             0xca => @floatCast(@as(f32, @bitCast(try reader.takeInt(u32, .big)))),
@@ -213,10 +216,84 @@ pub fn deserializeAlloc(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T
             }
             const n = try arrLen(b, reader) orelse return error.BadValue;
             if (n != info.len) return error.BadValue;
+            var done: usize = 0;
+            errdefer for (out[0..done]) |o| free(gpa, o);
             for (&out) |*o| {
                 o.* = try deserializeAlloc(info.child, gpa, reader);
+                done += 1;
             }
             return out;
+        },
+        .@"struct" => |info| {
+            inline for (info.field_attrs) |attrs| {
+                if (attrs.@"comptime") @compileError("msgpack: types with comptime fields are not supported: " ++ @typeName(T));
+            }
+            var out: T = undefined;
+            const b = try reader.takeByte();
+
+            if (info.is_tuple) {
+                const n = try arrLen(b, reader) orelse return error.BadValue;
+                if (n != info.field_names.len) return error.BadValue;
+
+                var done: usize = 0;
+
+                errdefer inline for (info.field_names, 0..) |name, idx| {
+                    if (idx < done) free(gpa, @field(out, name));
+                };
+                inline for (info.field_names, info.field_types) |name, FT| {
+                    @field(out, name) = try deserializeAlloc(FT, gpa, reader);
+                    done += 1;
+                }
+
+                return out;
+            }
+
+            const n = try mapLen(b, reader) orelse return error.BadValue;
+
+            if (n > info.field_names.len) return error.BadValue;
+
+            var seen: std.StaticBitSet(info.field_names.len) = .empty;
+            errdefer inline for (info.field_names, 0..) |name, idx| {
+                if (seen.isSet(idx)) free(gpa, @field(out, name));
+            };
+            for (0..n) |_| {
+                const kb = try reader.takeByte();
+                const klen = try strLen(kb, reader) orelse return error.BadValue;
+                const key = try reader.readAlloc(gpa, klen);
+                defer gpa.free(key);
+
+                var matched = false;
+                inline for (info.field_names, info.field_types, 0..) |name, FT, idx| {
+                    if (!matched and std.mem.eql(u8, name, key)) {
+                        matched = true;
+                        if (seen.isSet(idx)) return error.BadValue;
+                        seen.set(idx);
+                        @field(out, name) = try deserializeAlloc(FT, gpa, reader);
+                    }
+                }
+                if (!matched) return error.BadValue;
+            }
+            inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, FT, attrs, idx| {
+                if (!seen.isSet(idx)) {
+                    if (comptime attrs.defaultValue(FT)) |d| {
+                        @field(out, name) = d;
+                    } else {
+                        return error.MissingField;
+                    }
+                }
+            }
+
+            return out;
+        },
+        .@"enum" => |info| {
+            if (info.mode == .nonexhaustive) {
+                return @fromBackingInt(try deserializeAlloc(info.tag_type, gpa, reader));
+            }
+            const b = try reader.takeByte();
+            const len = try strLen(b, reader) orelse return error.BadValue;
+            const name = try reader.readAlloc(gpa, len);
+            defer gpa.free(name);
+            return std.meta.stringToEnum(T, name) orelse error.BadValue;
         },
         else => @compileError("msgpack: unsupported type " ++ @typeName(T)),
     }
@@ -227,10 +304,15 @@ fn deserializeSequence(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T 
     const Child = std.meta.Child(T);
     const b = try reader.takeByte();
     if (try arrLen(b, reader)) |n| {
+        var done: usize = 0;
         const out = try gpa.alloc(Child, n);
-        errdefer gpa.free(out);
+        errdefer {
+            for (out[0..done]) |o| free(gpa, o);
+            gpa.free(out);
+        }
         for (out) |*o| {
             o.* = try deserializeAlloc(Child, gpa, reader);
+            done += 1;
         }
         return out;
     }
@@ -259,6 +341,33 @@ fn arrLen(b: u8, reader: *Io.Reader) !?usize {
         0xdd => @intCast(try reader.takeInt(u32, .big)),
         else => null,
     };
+}
+
+fn mapLen(b: u8, reader: *Io.Reader) !?usize {
+    if (b & 0b11110000 == 0b10000000)
+        return b & 0b00001111;
+
+    return switch (b) {
+        0xde => @intCast(try reader.takeInt(u16, .big)),
+        0xdf => @intCast(try reader.takeInt(u32, .big)),
+        else => null,
+    };
+}
+
+pub fn free(gpa: Allocator, value: anytype) void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .optional => if (value) |v| free(gpa, v),
+        .pointer => |info| if (info.size == .slice) {
+            for (value) |e| free(gpa, e);
+            gpa.free(value);
+        },
+        .array => for (value) |e| free(gpa, e),
+        .@"struct" => |info| inline for (info.field_names, info.field_attrs) |name, attrs| {
+            if (!attrs.@"comptime") free(gpa, @field(value, name));
+        },
+        else => {},
+    }
 }
 
 test serialize {
@@ -322,6 +431,10 @@ test serialize {
     try serialize(writer, S{ .key = 3 });
     try std.testing.expectEqualStrings(&.{ 0x81, 0xa3, 0x6b, 0x65, 0x79, 0x03 }, w.written());
     w.clearRetainingCapacity();
+
+    try serialize(writer, @as(f16, 1.5));
+    try std.testing.expectEqualStrings(&.{ 0xca, 0x3f, 0xc0, 0x00, 0x00 }, w.written());
+    w.clearRetainingCapacity();
 }
 
 test deserializeAlloc {
@@ -375,5 +488,201 @@ test deserializeAlloc {
     {
         var r: Io.Reader = .fixed(&.{ 0xdc, 0x00, 0x03, 0x01, 0xcd, 0x01, 0x00, 0x03 });
         try std.testing.expectEqual([3]u64{ 1, 256, 3 }, try deserializeAlloc([3]u64, gpa, &r));
+    }
+    {
+        const S = struct { key: u64 };
+        var r: Io.Reader = .fixed(&.{ 0x81, 0xa3, 0x6b, 0x65, 0x79, 0x03 });
+        const out = try deserializeAlloc(S, gpa, &r);
+        try std.testing.expectEqualDeep(S{ .key = 3 }, out);
+    }
+    {
+        const S = struct { a: u64, b: u64 };
+        var r: Io.Reader = .fixed(&.{ 0x82, 0xa1, 'b', 0x02, 0xa1, 'a', 0x01 });
+        try std.testing.expectEqual(S{ .a = 1, .b = 2 }, try deserializeAlloc(S, gpa, &r));
+    }
+    {
+        const S = struct { a: u64, b: u64 };
+        var r: Io.Reader = .fixed(&.{ 0x81, 0xa1, 'a', 0x01 });
+        try std.testing.expectError(error.MissingField, deserializeAlloc(S, gpa, &r));
+    }
+    {
+        const S = struct { a: u64, b: u64 };
+        var r: Io.Reader = .fixed(&.{ 0x82, 0xa1, 'a', 0x01, 0xa1, 'a', 0x01 });
+        try std.testing.expectError(error.BadValue, deserializeAlloc(S, gpa, &r));
+    }
+    {
+        const S = struct { a: u64 = 5 };
+        var r: Io.Reader = .fixed(&.{ 0x81, 0xa1, 'z', 0x01 });
+        try std.testing.expectError(error.BadValue, deserializeAlloc(S, gpa, &r));
+    }
+    {
+        const S = struct { a: u64, b: u64 = 7 };
+        var r: Io.Reader = .fixed(&.{ 0x81, 0xa1, 'a', 0x01 });
+        try std.testing.expectEqual(S{ .a = 1, .b = 7 }, try deserializeAlloc(S, gpa, &r));
+    }
+    {
+        const S = struct { a: u64, b: u64 };
+        var buf: [64]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        try serialize(&w, S{ .a = 300, .b = 4 });
+        var r: Io.Reader = .fixed(w.buffered());
+        try std.testing.expectEqual(S{ .a = 300, .b = 4 }, try deserializeAlloc(S, gpa, &r));
+    }
+    {
+        const S = struct { s: []u8, x: u64 };
+        var r: Io.Reader = .fixed(&.{ 0x82, 0xa1, 's', 0xa2, 'h', 'i', 0xa1, 'x', 0xc3 });
+        try std.testing.expectError(error.BadValue, deserializeAlloc(S, gpa, &r));
+    }
+    {
+        const S = struct { x: u64, s: []u8 };
+        var r: Io.Reader = .fixed(&.{ 0x82, 0xa1, 'x', 0xc3 });
+        try std.testing.expectError(error.BadValue, deserializeAlloc(S, gpa, &r));
+    }
+    {
+        var r: Io.Reader = .fixed(&.{ 0x92, 0xa2, 'h', 'i', 0xc3 });
+        try std.testing.expectError(error.BadValue, deserializeAlloc([][]u8, gpa, &r));
+    }
+    {
+        var r: Io.Reader = .fixed(&.{ 0x92, 0xa2, 'h', 'i', 0xc3 });
+        try std.testing.expectError(error.BadValue, deserializeAlloc([2][]u8, gpa, &r));
+    }
+    {
+        const S = struct { name: []u8, tags: [][]u8 };
+        var r: Io.Reader = .fixed(&.{ 0x82, 0xa4, 'n', 'a', 'm', 'e', 0xa2, 'h', 'i', 0xa4, 't', 'a', 'g', 's', 0x92, 0xa1, 'x', 0xa1, 'y' });
+        const out = try deserializeAlloc(S, gpa, &r);
+        defer free(gpa, out);
+        try std.testing.expectEqualStrings("hi", out.name);
+        try std.testing.expectEqual(2, out.tags.len);
+        try std.testing.expectEqualStrings("x", out.tags[0]);
+        try std.testing.expectEqualStrings("y", out.tags[1]);
+    }
+    {
+        const max_u64 = [_]u8{ 0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+        const min_i64 = [_]u8{ 0xd3, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        const cases = .{
+            .{ u8, &[_]u8{ 0xcd, 0x01, 0x00 } },
+            .{ u8, &[_]u8{0xff} },
+            .{ i8, &[_]u8{ 0xcc, 0x80 } },
+            .{ i64, &max_u64 },
+            .{ u64, &min_i64 },
+            .{ u3, &[_]u8{0x08} },
+        };
+        inline for (cases) |c| {
+            var r: Io.Reader = .fixed(c[1]);
+            try std.testing.expectError(error.BadValue, deserializeAlloc(c[0], gpa, &r));
+        }
+    }
+    {
+        const cases = .{
+            .{ @as(u64, std.math.maxInt(u64)), &[_]u8{ 0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } },
+            .{ @as(i64, std.math.minInt(i64)), &[_]u8{ 0xd3, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+            .{ @as(i8, -128), &[_]u8{ 0xd0, 0x80 } },
+            .{ @as(i8, -1), &[_]u8{0xff} },
+            .{ @as(u8, 5), &[_]u8{ 0xd0, 0x05 } },
+            .{ @as(u3, 7), &[_]u8{0x07} },
+            .{ @as(u0, 0), &[_]u8{0x00} },
+        };
+        inline for (cases) |c| {
+            var r: Io.Reader = .fixed(c[1]);
+            try std.testing.expectEqual(c[0], try deserializeAlloc(@TypeOf(c[0]), gpa, &r));
+        }
+    }
+    {
+        const cases = .{
+            @as(i64, std.math.minInt(i64)),
+            @as(i8, -33),
+            @as(i8, -32),
+            @as(u64, std.math.maxInt(u64)),
+            @as(u16, 128),
+            @as(i16, 300),
+            @as(f16, 1.5),
+        };
+        inline for (cases) |v| {
+            var buf: [16]u8 = undefined;
+            var w: Writer = .fixed(&buf);
+            try serialize(&w, v);
+            var r: Io.Reader = .fixed(w.buffered());
+            try std.testing.expectEqual(v, try deserializeAlloc(@TypeOf(v), gpa, &r));
+        }
+    }
+    {
+        const P = struct { u64, i8 };
+        var buf: [16]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        try serialize(&w, P{ 300, -5 });
+        var r: Io.Reader = .fixed(w.buffered());
+        try std.testing.expectEqual(P{ 300, -5 }, try deserializeAlloc(P, gpa, &r));
+    }
+    {
+        const P = struct { u64, u64 };
+        var r: Io.Reader = .fixed(&.{ 0x93, 0x01, 0x02, 0x03 });
+        try std.testing.expectError(error.BadValue, deserializeAlloc(P, gpa, &r));
+    }
+    {
+        const P = struct { u64, u64 };
+        var r: Io.Reader = .fixed(&.{ 0x82, 0xa1, '0', 0x01, 0xa1, '1', 0x02 });
+        try std.testing.expectError(error.BadValue, deserializeAlloc(P, gpa, &r));
+    }
+    {
+        const P = struct { []u8, u64 };
+        var r: Io.Reader = .fixed(&.{ 0x92, 0xa2, 'h', 'i', 0xc3 });
+        try std.testing.expectError(error.BadValue, deserializeAlloc(P, gpa, &r));
+    }
+    {
+        const P = struct { []u8, [][]u8 };
+        var r: Io.Reader = .fixed(&.{ 0x92, 0xa2, 'h', 'i', 0x91, 0xa1, 'x' });
+        const out = try deserializeAlloc(P, gpa, &r);
+        defer free(gpa, out);
+        try std.testing.expectEqualStrings("hi", out[0]);
+        try std.testing.expectEqual(1, out[1].len);
+        try std.testing.expectEqualStrings("x", out[1][0]);
+    }
+    {
+        const E = enum(u8) {
+            a = 1,
+        };
+        var r: Io.Reader = .fixed(&.{ 0xa1, 'a' });
+        try std.testing.expectEqual(E.a, try deserializeAlloc(E, gpa, &r));
+    }
+    {
+        const E = enum { red, green };
+        const N = enum(i8) { a = -3, _ };
+        const cases = .{ E.red, E.green, @as(N, .a), @as(N, @fromBackingInt(100)), @as(N, @fromBackingInt(-128)) };
+        inline for (cases) |v| {
+            var buf: [16]u8 = undefined;
+            var w: Writer = .fixed(&buf);
+            try serialize(&w, v);
+            var r: Io.Reader = .fixed(w.buffered());
+            try std.testing.expectEqual(v, try deserializeAlloc(@TypeOf(v), gpa, &r));
+        }
+    }
+    {
+        const E = enum { red, green };
+        const N = enum(i8) { a = -3, _ };
+        const cases = .{
+            // unknown tag name
+            .{ E, &[_]u8{ 0xa4, 'b', 'l', 'u', 'e' } },
+            // tag name with a different case
+            .{ E, &[_]u8{ 0xa3, 'R', 'e', 'd' } },
+            // integer for an exhaustive enum
+            .{ E, &[_]u8{0x00} },
+            // string for a non-exhaustive enum
+            .{ N, &[_]u8{ 0xa1, 'a' } },
+            // 200 does not fit in i8
+            .{ N, &[_]u8{ 0xcc, 0xc8 } },
+        };
+        inline for (cases) |c| {
+            var r: Io.Reader = .fixed(c[1]);
+            try std.testing.expectError(error.BadValue, deserializeAlloc(c[0], gpa, &r));
+        }
+    }
+    {
+        const E = enum { red, green };
+        const S = struct { color: E, tags: []E };
+        var r: Io.Reader = .fixed(&.{ 0x82, 0xa5, 'c', 'o', 'l', 'o', 'r', 0xa5, 'g', 'r', 'e', 'e', 'n', 0xa4, 't', 'a', 'g', 's', 0x92, 0xa3, 'r', 'e', 'd', 0xa5, 'g', 'r', 'e', 'e', 'n' });
+        const out = try deserializeAlloc(S, gpa, &r);
+        defer free(gpa, out);
+        try std.testing.expectEqual(E.green, out.color);
+        try std.testing.expectEqualSlices(E, &.{ .red, .green }, out.tags);
     }
 }
