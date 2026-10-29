@@ -3,6 +3,11 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Writer = Io.Writer;
 
+const Timestamp64 = packed struct(u64) {
+    seconds: u34,
+    nanoseconds: u30,
+};
+
 pub fn serialize(writer: *Writer, msg: anytype) !void {
     const T = @TypeOf(msg);
 
@@ -61,13 +66,17 @@ pub fn serialize(writer: *Writer, msg: anytype) !void {
                 const nsec: u32 = @intCast(@mod(ns, std.time.ns_per_s));
                 if (sec >= 0 and sec >> 34 == 0) {
                     if (nsec == 0 and sec <= std.math.maxInt(u32)) {
+                        // timestamp 32
                         try writer.writeAll(&.{ 0xd6, 0xff });
                         try writer.writeInt(u32, @intCast(sec), .big);
                     } else {
+                        // timestamp 64
+                        const s: Timestamp64 = .{ .nanoseconds = @intCast(nsec), .seconds = @intCast(sec) };
                         try writer.writeAll(&.{ 0xd7, 0xff });
-                        try writer.writeInt(u64, (@as(u64, nsec) << 34) | @as(u64, @intCast(sec)), .big);
+                        try writer.writeInt(u64, @bitCast(s), .big);
                     }
                 } else {
+                    // timestamp 96
                     try writer.writeAll(&.{ 0xc7, 12, 0xff });
                     try writer.writeInt(u32, nsec, .big);
                     try writer.writeInt(i64, sec, .big);
@@ -206,16 +215,19 @@ pub fn deserializeAlloc(comptime T: type, gpa: Allocator, reader: *Io.Reader) !T
                 var sec: i64 = undefined;
                 var nsec: u32 = 0;
                 switch (b) {
+                    // timestamp 32
                     0xd6 => {
                         if (try reader.takeByte() != 0xff) return error.BadValue;
                         sec = try reader.takeInt(u32, .big);
                     },
+                    // timestamp 64
                     0xd7 => {
                         if (try reader.takeByte() != 0xff) return error.BadValue;
-                        const data = try reader.takeInt(u64, .big);
-                        sec = @intCast(data & ((1 << 34) - 1));
-                        nsec = @intCast(data >> 34);
+                        const data: Timestamp64 = @bitCast(try reader.takeInt(u64, .big));
+                        sec = data.seconds;
+                        nsec = data.nanoseconds;
                     },
+                    // timestamp 96
                     0xc7 => {
                         const hdr = try reader.takeArray(2);
                         if (!std.mem.eql(u8, hdr, &.{ 12, 0xff })) return error.BadValue;
