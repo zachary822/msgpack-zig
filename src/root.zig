@@ -24,12 +24,8 @@ pub fn serialize(writer: *Writer, msg: anytype) !void {
                 try writer.writeByte(@intCast(msg));
                 return;
             }
-            const storage_bits = comptime std.math.ceilPowerOfTwoAssert(u16, @max(info.bits, 8));
-            const storage_bytes = storage_bits / 8;
-            const Int = @Int(info.signedness, storage_bits);
-            const tag: u8 = (if (info.signedness == .unsigned) 0xcc else 0xd0) + @as(u8, @intCast(@ctz(storage_bytes)));
-            try writer.writeByte(tag);
-            try writer.writeInt(Int, @intCast(msg), .big);
+            if (msg >= 0) return writeSmallestInt(writer, @as(u64, @intCast(msg)));
+            return writeSmallestInt(writer, @as(i64, @intCast(msg)));
         },
         .float => |info| {
             if (info.bits > 64) @compileError("msgpack: floats wider than 64 bits are not supported: " ++ @typeName(T));
@@ -128,6 +124,23 @@ fn serializeSequence(writer: *Writer, msg: anytype) !void {
     }
     try writeHeader(writer, values.len, 0x90, 0xdc);
     for (values) |e| try serialize(writer, e);
+}
+
+/// Writes `v` in the smallest uint (0xcc-0xcf) or int (0xd0-0xd3) format.
+/// Signed values must be negative; non-negative values use the uint formats.
+fn writeSmallestInt(writer: *Writer, v: anytype) !void {
+    const Int = @TypeOf(v);
+    const signedness = @typeInfo(Int).int.signedness;
+    const bits: u16 = if (signedness == .signed)
+        @bitSizeOf(Int) - @as(u16, @clz(~v)) + 1
+    else
+        @bitSizeOf(Int) - @as(u16, @clz(v));
+    const index = std.math.log2_int_ceil(u16, (bits + 7) / 8);
+    try writer.writeByte((if (signedness == .unsigned) 0xcc else 0xd0) + @as(u8, @intCast(index)));
+    switch (index) {
+        inline 0...3 => |i| try writer.writeInt(@Int(signedness, 8 << i), @intCast(v), .big),
+        else => unreachable,
+    }
 }
 
 fn writeHeader(writer: *Writer, len: usize, fix: u8, tag16: u8) !void {
